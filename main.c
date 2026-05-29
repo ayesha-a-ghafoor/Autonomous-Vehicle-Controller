@@ -1,94 +1,67 @@
 
-
+    {
+    }
 #define F_CPU 16000000UL
 #include <avr/io.h>
-#include <util/delay.h>
+#include <avr/interrupt.h>
 
-// --- Pin Mapping ---
-// Motors: PD4, PD5, PD6, PD7 (corresponds to Arduino 4, 5, 6, 7)
-// Trigger: PC0 (Arduino A0)
-// Echo: PC1 (Arduino A1)
-// Servo: PB1 (Arduino 9 - Using Timer 1 for PWM)
+// 7-segment patterns for Common Cathode (0-9)
+// Hex values: 0:0x3F, 1:0x06, 2:0x5B, 3:0x4F, 4:0x66, 5:0x6D, 6:0x7D, 7:0x07, 8:0x7F, 9:0x6F
+uint8_t segment_map[] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+volatile int8_t current_digit = 0;
 
-void init_hardware() {
-	// Set PD4-PD7 as Output for Motors
-	DDRD |= (1 << PD4) | (1 << PD5) | (1 << PD6) | (1 << PD7);
+void UART_init(unsigned int ubrr) {
+	// Set baud rate registers
+	UBRR0H = (unsigned char)(ubrr >> 8);
+	UBRR0L = (unsigned char)ubrr;
 	
-	// Set PC0 (Trig) as Output, PC1 (Echo) as Input
-	DDRC |= (1 << DDC0);
-	DDRC &= ~(1 << DDC1);
+	// Enable receiver, transmitter, and RX Complete Interrupt
+	UCSR0B = (1 << RXCIE0) | (1 << RXEN0) | (1 << TXEN0);
 	
-	// --- Servo PWM Setup (Timer 1) ---
-	DDRB |= (1 << DDB1); // Set PB1 as Output
-	// Fast PWM, Top=ICR1, Clear OC1A on Compare Match
-	TCCR1A |= (1 << COM1A1) | (1 << WGM11);
-	TCCR1B |= (1 << WGM13) | (1 << WGM12) | (1 << CS11); // Prescaler 8
-	ICR1 = 39999; // 20ms period for servo
+	// Set frame format: 8 data bits, 1 stop bit
+	UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 }
 
-void set_servo(int angle) {
-	// Map 0-180 degrees to pulse width (approx 1000 to 4800)
-	OCR1A = 1000 + (angle * 21);
-}
-
-uint16_t get_distance() {
-	PORTC &= ~(1 << PORTC0);
-	_delay_us(2);
-	PORTC |= (1 << PORTC0);
-	_delay_us(10);
-	PORTC &= ~(1 << PORTC0);
-	
-	uint16_t count = 0;
-	while (!(PINC & (1 << PINC1)) && count < 65000) count++; // Wait for High
-	
-	uint16_t duration = 0;
-	while ((PINC & (1 << PINC1)) && duration < 65000) {
-		_delay_us(1);
-		duration++;
+void UART_send_string(char* str) {
+	while (*str) {
+		while (!(UCSR0A & (1 << UDRE0))); // Wait for empty transmit buffer
+		UDR0 = *str++;
 	}
-	return duration / 58; // Convert to cm
 }
 
-// --- Movement Functions ---
-void move_forward() {
-	PORTD = (1 << PD4) | (1 << PD6); // IN1 and IN3 HIGH
-}
+// ISR triggers when a character is received from TeraTerm
+ISR(USART_RX_vect) {
+	char received_char = UDR0; // Read the character from PC
 
-void stop_motors() {
-	PORTD &= ~((1 << PD4) | (1 << PD5) | (1 << PD6) | (1 << PD7));
+	if (received_char == 'u') {
+		// Ascending order logic: 0,1,2...8,9,0...
+		current_digit++;
+		if (current_digit > 9) current_digit = 0;
+	}
+	else if (received_char == 'd') {
+		// Descending order logic: 9,8,7...1,0,9...
+		current_digit--;
+		if (current_digit < 0) current_digit = 9;
+	}
+	else {
+		// Notify error if character is not 'u' or 'd'
+		UART_send_string("ERR\r\n");
+	}
 }
 
 int main(void) {
-	init_hardware();
-	set_servo(90); // Look forward
-	_delay_ms(1000);
+	// Configure PORTD as output for the 7-segment display
+	DDRD = 0xFF;
+	
+	// Initialize UART at 9600 baud (Value 103 for 16MHz)
+	UART_init(103);
+	
+	// Global Interrupt Enable
+	sei();
 
 	while (1) {
-		if (get_distance() < 20) {
-			stop_motors();
-			_delay_ms(500);
-			
-			// Basic Logic: Look left/right (simplified for pure C)
-			set_servo(10); // Look Right
-			_delay_ms(500);
-			uint16_t d_right = get_distance();
-			
-			set_servo(170); // Look Left
-			_delay_ms(500);
-			uint16_t d_left = get_distance();
-			
-			set_servo(90); // Center
-			_delay_ms(500);
-			
-			if (d_left > d_right) {
-				PORTD = (1 << PD4) | (1 << PD7); // Turn Left
-				} else {
-				PORTD = (1 << PD5) | (1 << PD6); // Turn Right
-			}
-			_delay_ms(500);
-			stop_motors();
-			} else {
-			move_forward();
-		}
+		// Initially 0 is displayed, then updates based on 'current_digit'
+		PORTD = segment_map[current_digit];
 	}
 }
+
