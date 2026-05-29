@@ -1,67 +1,132 @@
-
-    {
-    }
-#define F_CPU 16000000UL
+#define F_CPU 16000000UL // 16 MHz Clock (Arduino Uno Standard)
 #include <avr/io.h>
-#include <avr/interrupt.h>
+#include <util/delay.h>
+#include <stdint.h>
 
-// 7-segment patterns for Common Cathode (0-9)
-// Hex values: 0:0x3F, 1:0x06, 2:0x5B, 3:0x4F, 4:0x66, 5:0x6D, 6:0x7D, 7:0x07, 8:0x7F, 9:0x6F
-uint8_t segment_map[] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
-volatile int8_t current_digit = 0;
+// --- Macros for Motor Control (safely only changing PD4-PD7) ---
+#define MOTOR_MASK ((1 << PD4) | (1 << PD5) | (1 << PD6) | (1 << PD7))
 
-void UART_init(unsigned int ubrr) {
-	// Set baud rate registers
-	UBRR0H = (unsigned char)(ubrr >> 8);
-	UBRR0L = (unsigned char)ubrr;
-	
-	// Enable receiver, transmitter, and RX Complete Interrupt
-	UCSR0B = (1 << RXCIE0) | (1 << RXEN0) | (1 << TXEN0);
-	
-	// Set frame format: 8 data bits, 1 stop bit
-	UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+void init_hardware() {
+// 1. Motor Pins (PD4-PD7) & Buzzer (PD2) as Output
+DDRD |= MOTOR_MASK | (1 << DDD2);
+
+// 2. Ultrasonic Pins: Trig (PC0) as Output, Echo (PC1) as Input
+DDRC |= (1 << DDC0);
+DDRC &= ~(1 << DDC1);
+
+// 3. Servo (PB1), Red LED (PB0) & Yellow LED (PB2) as Output
+DDRB |= (1 << DDB0) | (1 << DDB1) | (1 << DDB2);
+
+// 4. Timer 1 Setup for Servo PWM on PB1 (Fast PWM, Top=ICR1)
+TCCR1A |= (1 << COM1A1) | (1 << WGM11);
+TCCR1B |= (1 << WGM13) | (1 << WGM12) | (1 << CS11); // Prescaler 8
+ICR1 = 39999; // 20ms period (50Hz)
 }
 
-void UART_send_string(char* str) {
-	while (*str) {
-		while (!(UCSR0A & (1 << UDRE0))); // Wait for empty transmit buffer
-		UDR0 = *str++;
-	}
+void set_servo(int angle) {
+// Map 0-180 degrees to pulse width (approx 1000 to 4800)
+OCR1A = 1000 + (angle * 21);
 }
 
-// ISR triggers when a character is received from TeraTerm
-ISR(USART_RX_vect) {
-	char received_char = UDR0; // Read the character from PC
+uint16_t get_distance() {
+// Send 10us Trigger Pulse
+PORTC &= ~(1 << PORTC0);
+_delay_us(2);
+PORTC |= (1 << PORTC0);
+_delay_us(10);
+PORTC &= ~(1 << PORTC0);
 
-	if (received_char == 'u') {
-		// Ascending order logic: 0,1,2...8,9,0...
-		current_digit++;
-		if (current_digit > 9) current_digit = 0;
-	}
-	else if (received_char == 'd') {
-		// Descending order logic: 9,8,7...1,0,9...
-		current_digit--;
-		if (current_digit < 0) current_digit = 9;
-	}
-	else {
-		// Notify error if character is not 'u' or 'd'
-		UART_send_string("ERR\r\n");
-	}
+// Wait for Echo to go High (with timeout)
+uint16_t count = 0;
+while (!(PINC & (1 << PINC1)) && count < 65000) count++;
+
+// Measure how long Echo stays High
+uint16_t duration = 0;
+while ((PINC & (1 << PINC1)) && duration < 65000) {
+_delay_us(1);
+duration++;
+}
+
+return duration / 58; // Convert microseconds to cm
+}
+
+// --- Movement Functions ---
+void move_forward() {
+PORTD = (PORTD & ~MOTOR_MASK) | (1 << PD4) | (1 << PD6);
+}
+
+void move_backward() {
+PORTD = (PORTD & ~MOTOR_MASK) | (1 << PD5) | (1 << PD7);
+}
+
+void turn_left() {
+PORTD = (PORTD & ~MOTOR_MASK) | (1 << PD4) | (1 << PD7);
+}
+
+void turn_right() {
+PORTD = (PORTD & ~MOTOR_MASK) | (1 << PD5) | (1 << PD6);
+}
+
+void stop_motors() {
+PORTD &= ~MOTOR_MASK; // Set all motor pins to LOW
 }
 
 int main(void) {
-	// Configure PORTD as output for the 7-segment display
-	DDRD = 0xFF;
-	
-	// Initialize UART at 9600 baud (Value 103 for 16MHz)
-	UART_init(103);
-	
-	// Global Interrupt Enable
-	sei();
+init_hardware();
+set_servo(90); // Look straight
 
-	while (1) {
-		// Initially 0 is displayed, then updates based on 'current_digit'
-		PORTD = segment_map[current_digit];
-	}
+// Welcome Beep
+PORTD |= (1 << PORTD2); // Buzzer ON
+_delay_ms(100);
+PORTD &= ~(1 << PORTD2); // Buzzer OFF
+_delay_ms(1000);
+
+while (1) {
+uint16_t distance = get_distance();
+
+if (distance > 0 && distance < 25) {
+stop_motors();
+
+// Obstacle Warning: Buzzer Beep
+PORTD |= (1 << PORTD2);
+_delay_ms(200);
+PORTD &= ~(1 << PORTD2);
+
+move_backward();
+_delay_ms(400);
+stop_motors();
+
+// Look Left
+set_servo(170);
+_delay_ms(500);
+uint16_t left_dist = get_distance();
+
+// Look Right
+set_servo(10);
+_delay_ms(500);
+uint16_t right_dist = get_distance();
+
+// Center Head
+set_servo(90);
+_delay_ms(500);
+
+// Decision Making
+if (left_dist >= right_dist) {
+PORTB |= (1 << PORTB0); // Red LED ON
+turn_left();
+_delay_ms(600);
+PORTB &= ~(1 << PORTB0); // Red LED OFF
+} else {
+PORTB |= (1 << PORTB2); // Yellow LED ON
+turn_right();
+_delay_ms(600);
+PORTB &= ~(1 << PORTB2); // Yellow LED OFF
 }
-
+stop_motors();
+} else {
+// Path is clear
+move_forward();
+}
+_delay_ms(50); // Small loop delay
+}
+} isko samjhao like A-z kh kia hia aur kaisay hia yai libraray q use ki h9a wagira sb
